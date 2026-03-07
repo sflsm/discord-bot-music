@@ -20,6 +20,7 @@ const {
   createAudioPlayer,
   createAudioResource,
   AudioPlayerStatus,
+  StreamType,
   generateDependencyReport
 } = require("@discordjs/voice");
 
@@ -31,7 +32,7 @@ const client = new Client({
 });
 
 // ================= FOLDER =================
-const MUSIC_DIR = path.join(__dirname, "music");
+const MUSIC_DIR = path.resolve(__dirname, "music");
 if (!fs.existsSync(MUSIC_DIR)) fs.mkdirSync(MUSIC_DIR);
 
 // ================= VARIABLES =================
@@ -92,7 +93,6 @@ function playNext() {
   if (repeatMode === 2 && currentTrack) {
     playIndex = playlist.indexOf(currentTrack);
   }
-
   // Shuffle mode
   else if (shuffle) {
     const availableSongs = playlist.map((_, i) => i).filter(i => !playedSongs.has(i));
@@ -119,7 +119,6 @@ function playNext() {
     playedSongs.add(playIndex);
     index = playIndex + 1;
   }
-
   // Normal mode
   else {
     if (index >= playlist.length) {
@@ -139,25 +138,25 @@ function playNext() {
   }
 
   const file = playlist[playIndex];
-  const { spawn } = require("child_process");
-const { StreamType } = require("@discordjs/voice");
 
-const ffmpeg = spawn("ffmpeg", [
-  "-re",        // baca file sesuai rate normal
-  "-i", file,   // file mp3
-  "-f", "s16le",
-  "-ar", "48000",
-  "-ac", "2",
-  "pipe:1"
-]);
+  // ===== FFMPEG RESOURCE =====
+  const ffmpeg = spawn("ffmpeg", [
+    "-re",
+    "-i", file,
+    "-f", "s16le",
+    "-ar", "48000",
+    "-ac", "2",
+    "pipe:1"
+  ]);
 
-const resource = createAudioResource(ffmpeg.stdout, {
-  inputType: StreamType.Raw,
-  inlineVolume: true,    // bisa atur volume
-  highWaterMark: 1 << 26 // buffer 64MB → lebih stabil
-});
+  ffmpeg.on("error", e => console.error("FFmpeg error:", e.message));
+  ffmpeg.stderr.on("data", d => console.log("FFmpeg stderr:", d.toString()));
 
-player.play(resource);
+  const resource = createAudioResource(ffmpeg.stdout, {
+    inputType: StreamType.Raw,
+    inlineVolume: true,
+    highWaterMark: 1 << 26
+  });
 
   player.play(resource);
   currentTrack = file;
@@ -224,12 +223,13 @@ function buildPlaylistUI() {
   }));
   options.push({ label: "Hapus Semua Playlist", value: "delete_all" });
 
-  const row = new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId("remove_select").setPlaceholder("Pilih lagu untuk dihapus").addOptions(options));
+  const row = new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId("remove_select").setPlaceholder("Pilih lagu untuk dihapus").addOptions(options)
+  );
   return { embeds: [embed], components: [row] };
 }
 
 client.on(Events.InteractionCreate, async interaction => {
-
   // ===== SELECT MENU =====
   if (interaction.isStringSelectMenu() && interaction.customId === "remove_select") {
     await interaction.deferReply({ flags: 64 });
@@ -256,7 +256,6 @@ client.on(Events.InteractionCreate, async interaction => {
     await interaction.deferUpdate();
 
     switch (interaction.customId) {
-
       case "shuffle":
         shuffle = !shuffle;
         playedSongs.clear();
@@ -266,7 +265,6 @@ client.on(Events.InteractionCreate, async interaction => {
           index = pos === -1 ? 0 : pos + 1;
         }
         break;
-
       case "previous":
         if (!playlist.length) return;
         if (shuffle) {
@@ -277,17 +275,14 @@ client.on(Events.InteractionCreate, async interaction => {
         }
         player.stop();
         break;
-
       case "play_pause":
         if (player.state.status === AudioPlayerStatus.Playing) player.pause();
         else player.unpause();
         break;
-
       case "next":
         if (!playlist.length) return;
         player.stop();
         break;
-
       case "repeat":
         repeatMode = (repeatMode + 1) % 3;
         break;
@@ -324,12 +319,20 @@ client.on(Events.InteractionCreate, async interaction => {
     let json = "";
     const info = spawn("yt-dlp", ["--dump-json", "--no-playlist", url]);
     info.stdout.on("data", d => json += d.toString());
+    info.stderr.on("data", d => console.log("yt-dlp stderr:", d.toString()));
 
     info.on("close", () => {
       let meta;
-      try { meta = JSON.parse(json); } catch { return interaction.editReply("❌ Gagal membaca metadata."); }
+      try { meta = JSON.parse(json); } catch {
+        return interaction.editReply({ content: "❌ Gagal membaca metadata." });
+      }
       const safeTitle = meta.title.replace(/[\\/:*?"<>|]/g, "");
-      const dl = spawn("yt-dlp", ["-x","--audio-format","mp3","--audio-quality","0","--concurrent-fragments","10","--buffer-size","16K","--no-playlist","-o", `${MUSIC_DIR}/${safeTitle}.%(ext)s`, url]);
+      const dl = spawn("yt-dlp", [
+        "-x","--audio-format","mp3","--audio-quality","0",
+        "--concurrent-fragments","10","--buffer-size","16K",
+        "--no-playlist","-o", `${MUSIC_DIR}/${safeTitle}.%(ext)s`, url
+      ]);
+      dl.stderr.on("data", d => console.log("yt-dlp download stderr:", d.toString()));
       dl.on("close", () => {
         thumbnailMap[safeTitle] = meta.thumbnail;
         loadPlaylist();
@@ -337,7 +340,6 @@ client.on(Events.InteractionCreate, async interaction => {
       });
     });
   }
-
 });
 
 // ================= UPDATE NOW PLAYING =================
