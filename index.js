@@ -32,7 +32,7 @@ const client = new Client({
 });
 
 // ================= FOLDER =================
-const MUSIC_DIR = path.resolve(__dirname, "music");
+const MUSIC_DIR = path.join(__dirname, "music");
 if (!fs.existsSync(MUSIC_DIR)) fs.mkdirSync(MUSIC_DIR);
 
 // ================= VARIABLES =================
@@ -93,6 +93,7 @@ function playNext() {
   if (repeatMode === 2 && currentTrack) {
     playIndex = playlist.indexOf(currentTrack);
   }
+
   // Shuffle mode
   else if (shuffle) {
     const availableSongs = playlist.map((_, i) => i).filter(i => !playedSongs.has(i));
@@ -119,6 +120,7 @@ function playNext() {
     playedSongs.add(playIndex);
     index = playIndex + 1;
   }
+
   // Normal mode
   else {
     if (index >= playlist.length) {
@@ -138,8 +140,6 @@ function playNext() {
   }
 
   const file = playlist[playIndex];
-
-  // ===== FFMPEG RESOURCE =====
   const ffmpeg = spawn("ffmpeg", [
     "-re",
     "-i", file,
@@ -148,9 +148,6 @@ function playNext() {
     "-ac", "2",
     "pipe:1"
   ]);
-
-  ffmpeg.on("error", e => console.error("FFmpeg error:", e.message));
-  ffmpeg.stderr.on("data", d => console.log("FFmpeg stderr:", d.toString()));
 
   const resource = createAudioResource(ffmpeg.stdout, {
     inputType: StreamType.Raw,
@@ -223,16 +220,15 @@ function buildPlaylistUI() {
   }));
   options.push({ label: "Hapus Semua Playlist", value: "delete_all" });
 
-  const row = new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder().setCustomId("remove_select").setPlaceholder("Pilih lagu untuk dihapus").addOptions(options)
-  );
+  const row = new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId("remove_select").setPlaceholder("Pilih lagu untuk dihapus").addOptions(options));
   return { embeds: [embed], components: [row] };
 }
 
 client.on(Events.InteractionCreate, async interaction => {
+
   // ===== SELECT MENU =====
   if (interaction.isStringSelectMenu() && interaction.customId === "remove_select") {
-    await interaction.deferReply({ flags: 64 });
+    await interaction.deferReply({ ephemeral: true });
     const selected = interaction.values[0];
 
     if (selected === "delete_all") {
@@ -265,6 +261,7 @@ client.on(Events.InteractionCreate, async interaction => {
           index = pos === -1 ? 0 : pos + 1;
         }
         break;
+
       case "previous":
         if (!playlist.length) return;
         if (shuffle) {
@@ -275,14 +272,17 @@ client.on(Events.InteractionCreate, async interaction => {
         }
         player.stop();
         break;
+
       case "play_pause":
         if (player.state.status === AudioPlayerStatus.Playing) player.pause();
         else player.unpause();
         break;
+
       case "next":
         if (!playlist.length) return;
         player.stop();
         break;
+
       case "repeat":
         repeatMode = (repeatMode + 1) % 3;
         break;
@@ -295,7 +295,10 @@ client.on(Events.InteractionCreate, async interaction => {
   // ===== COMMANDS =====
   if (!interaction.isChatInputCommand()) return;
 
+  // Playlist
   if (interaction.commandName === "playlist") return interaction.reply(buildPlaylistUI());
+
+  // Play
   if (interaction.commandName === "play") {
     if (!playlist.length) return interaction.reply("⚠︎ Playlist kosong.");
     playedSongs.clear();
@@ -303,43 +306,114 @@ client.on(Events.InteractionCreate, async interaction => {
     playNext();
     return interaction.reply("𝄞 Memulai playlist...");
   }
+
+  // Stop
   if (interaction.commandName === "stop") {
     player.stop(true);
     return interaction.reply("⏹ Musik dihentikan.");
   }
+
+  // Skip
   if (interaction.commandName === "skip") {
     player.stop();
     return interaction.reply("⏭ Lagu dilewati.");
   }
+
   if (interaction.commandName === "download") {
-    const url = interaction.options.getString("url");
-    await interaction.deferReply();
-    interaction.editReply({ embeds: [baseEmbed().setTitle("📥 Download").setDescription("Memproses download...")] });
-
-    let json = "";
-    const info = spawn("yt-dlp", ["--dump-json", "--no-playlist", url]);
-    info.stdout.on("data", d => json += d.toString());
-    info.stderr.on("data", d => console.log("yt-dlp stderr:", d.toString()));
-
-    info.on("close", () => {
-      let meta;
-      try { meta = JSON.parse(json); } catch {
-        return interaction.editReply({ content: "❌ Gagal membaca metadata." });
-      }
-      const safeTitle = meta.title.replace(/[\\/:*?"<>|]/g, "");
-      const dl = spawn("yt-dlp", [
-        "-x","--audio-format","mp3","--audio-quality","0",
-        "--concurrent-fragments","10","--buffer-size","16K",
-        "--no-playlist","-o", `${MUSIC_DIR}/${safeTitle}.%(ext)s`, url
-      ]);
-      dl.stderr.on("data", d => console.log("yt-dlp download stderr:", d.toString()));
-      dl.on("close", () => {
-        thumbnailMap[safeTitle] = meta.thumbnail;
-        loadPlaylist();
-        interaction.editReply({ embeds: [baseEmbed().setTitle("✅ Download Selesai").setDescription(`🎵 **${meta.title}**`).setThumbnail(meta.thumbnail)] });
-      });
+  const url = interaction.options.getString("url");
+  const COOKIES_FILE = path.join(__dirname, "cookies.txt");
+  if (!fs.existsSync(COOKIES_FILE)) {
+    return interaction.reply({
+      embeds: [
+        baseEmbed()
+          .setTitle("❌ Cookies Tidak Ditemukan")
+          .setDescription("Silakan letakkan file `cookies.txt` di folder project.")
+      ],
+      ephemeral: true
     });
   }
+
+  // DEFER REPLY
+  await interaction.deferReply({ flags: 64 });
+  await interaction.editReply({
+    embeds: [baseEmbed().setTitle("📥 Download").setDescription("Sedang memproses, harap tunggu...")]
+  });
+
+  try {
+    // Path ke yt-dlp
+    const ytDlpPath = path.join(__dirname, "yt-dlp.exe"); // Windows, sesuaikan di VPS misal "yt-dlp"
+
+    // ================= AMBIL METADATA =================
+    let json = "";
+    await new Promise((resolve, reject) => {
+      const info = spawn(ytDlpPath, [
+        "--dump-json",
+        "--no-playlist",
+        "--cookies", COOKIES_FILE,
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        url
+      ]);
+
+      info.stdout.on("data", d => json += d.toString());
+      info.stderr.on("data", d => console.log(d.toString()));
+
+      info.on("error", reject);
+      info.on("close", code => code === 0 ? resolve() : reject(new Error("Gagal ambil metadata")));
+    });
+
+    let meta;
+    try { meta = JSON.parse(json); } 
+    catch { return interaction.editReply("❌ Gagal membaca metadata video."); }
+
+    const safeTitle = meta.title.replace(/[\\/:*?"<>|]/g, "");
+
+    // ================= DOWNLOAD AUDIO =================
+    await new Promise((resolve, reject) => {
+      const dl = spawn(ytDlpPath, [
+        "-x",
+        "--audio-format", "mp3",
+        "--audio-quality", "0",
+        "--concurrent-fragments", "10",
+        "--buffer-size", "16K",
+        "--no-playlist",
+        "--cookies", COOKIES_FILE,
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "--sleep-interval", "1-3", // delay antar request untuk menghindari bot detection
+        "-o", `${MUSIC_DIR}/${safeTitle}.%(ext)s`,
+        url
+      ]);
+
+      dl.stdout.on("data", data => console.log(data.toString()));
+      dl.stderr.on("data", data => console.log(data.toString()));
+
+      dl.on("error", reject);
+      dl.on("close", code => code === 0 ? resolve() : reject(new Error("Gagal download")));
+    });
+
+    // ================= SIMPAN THUMBNAIL =================
+    thumbnailMap[safeTitle] = meta.thumbnail;
+    loadPlaylist();
+
+    await interaction.editReply({
+      embeds: [
+        baseEmbed()
+          .setTitle("✅ Download Selesai")
+          .setDescription(`🎵 **${meta.title}**`)
+          .setThumbnail(meta.thumbnail)
+      ]
+    });
+
+  } catch (err) {
+    console.error(err);
+    await interaction.editReply({
+      embeds: [
+        baseEmbed()
+          .setTitle("❌ Download Gagal")
+          .setDescription(err.message)
+      ]
+    });
+  }
+}
 });
 
 // ================= UPDATE NOW PLAYING =================
