@@ -47,7 +47,7 @@ let currentTrack = null;
 let textChannel;
 let nowPlayingMessage = null;
 let playedSongs = new Set();
-const thumbnailMap = {}; // simpan thumbnail URL
+const thumbnailMap = {};
 
 // ================= EMBED =================
 const baseEmbed = () => new EmbedBuilder().setColor(0x1db954).setTimestamp();
@@ -78,7 +78,7 @@ function createNowPlayingEmbed(filename) {
 // ================= LOAD PLAYLIST =================
 function loadPlaylist() {
   originalPlaylist = fs.readdirSync(MUSIC_DIR)
-    .filter(f => f.endsWith(".mp3"))
+    .filter(f => f.endsWith(".mp3") || f.endsWith(".m4a"))
     .map(f => path.join(MUSIC_DIR, f));
   playlist = [...originalPlaylist];
 }
@@ -89,15 +89,10 @@ function playNext() {
 
   let playIndex;
 
-  // Repeat One
   if (repeatMode === 2 && currentTrack) {
     playIndex = playlist.indexOf(currentTrack);
-  }
-
-  // Shuffle mode
-  else if (shuffle) {
+  } else if (shuffle) {
     const availableSongs = playlist.map((_, i) => i).filter(i => !playedSongs.has(i));
-
     if (availableSongs.length === 0) {
       if (repeatMode === 1) {
         playedSongs.clear();
@@ -115,14 +110,10 @@ function playNext() {
         return;
       }
     }
-
     playIndex = availableSongs[Math.floor(Math.random() * availableSongs.length)];
     playedSongs.add(playIndex);
     index = playIndex + 1;
-  }
-
-  // Normal mode
-  else {
+  } else {
     if (index >= playlist.length) {
       player.stop(true);
       textChannel?.send({
@@ -141,29 +132,37 @@ function playNext() {
 
   const file = playlist[playIndex];
   const ffmpeg = spawn("ffmpeg", [
-    "-re",
-    "-i", file,
-    "-f", "s16le",
-    "-ar", "48000",
-    "-ac", "2",
-    "pipe:1"
-  ]);
+  "-re",
+  "-i", file,
+  "-f", "s16le",
+  "-ar", "48000",
+  "-ac", "2",
+  "-vn",
+  "-bufsize", "512k",
+  "-threads", "2",
+  "-loglevel", "panic",
+  "-af", "afade=t=in:ss=0:d=0.5,afade=t=out:st=9999:d=0.8", // fade in 0.5s + fade out 0.5s
+  "pipe:1"
+]);
 
   const resource = createAudioResource(ffmpeg.stdout, {
     inputType: StreamType.Raw,
     inlineVolume: true,
-    highWaterMark: 1 << 26
+    highWaterMark: 1 << 27
   });
+
+  resource.volume.setVolume(0.8);
 
   player.play(resource);
   currentTrack = file;
 
-  const filename = path.basename(file, ".mp3");
+  const filename = path.basename(file, ".mp3").replace(".m4a", "");
   const embed = createNowPlayingEmbed(filename);
 
   if (!nowPlayingMessage) {
     textChannel?.send({ embeds: [embed], components: [controlButtons()] })
-      .then(msg => nowPlayingMessage = msg);
+      .then(msg => nowPlayingMessage = msg)
+      .catch(() => {});
   } else {
     nowPlayingMessage.edit({ embeds: [embed], components: [controlButtons()] }).catch(() => {});
   }
@@ -211,16 +210,18 @@ function buildPlaylistUI() {
     return { embeds: [baseEmbed().setTitle("📂 Playlist").setDescription("Playlist kosong.")], components: [] };
   }
 
-  const description = playlist.map((file, i) => `**${i + 1}.** ${path.basename(file, ".mp3")}`).join("\n");
+  const description = playlist.map((file, i) => `**${i + 1}.** ${path.basename(file, ".mp3").replace(".m4a", "")}`).join("\n");
   const embed = baseEmbed().setTitle("📂 Playlist").setDescription(description);
 
   const options = playlist.slice(0, 24).map((file, i) => ({
-    label: path.basename(file, ".mp3").slice(0, 100),
+    label: path.basename(file, ".mp3").replace(".m4a", "").slice(0, 100),
     value: String(i)
   }));
   options.push({ label: "Hapus Semua Playlist", value: "delete_all" });
 
-  const row = new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId("remove_select").setPlaceholder("Pilih lagu untuk dihapus").addOptions(options));
+  const row = new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId("remove_select").setPlaceholder("Pilih lagu untuk dihapus").addOptions(options)
+  );
   return { embeds: [embed], components: [row] };
 }
 
@@ -228,7 +229,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
   // ===== SELECT MENU =====
   if (interaction.isStringSelectMenu() && interaction.customId === "remove_select") {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: 64 });
     const selected = interaction.values[0];
 
     if (selected === "delete_all") {
@@ -237,8 +238,10 @@ client.on(Events.InteractionCreate, async interaction => {
       playlist = [];
       index = 0;
       await new Promise(r => setTimeout(r, 1000));
-      fs.readdirSync(MUSIC_DIR).forEach(f => { if (f.endsWith(".mp3")) fs.unlinkSync(path.join(MUSIC_DIR, f)); });
-      return interaction.editReply({ embeds: [baseEmbed().setTitle("🗑️ Playlist Dihapus").setDescription(`Berhasil menghapus **${total} lagu** dari playlist.`)] });
+      fs.readdirSync(MUSIC_DIR).forEach(f => { if (f.endsWith(".mp3") || f.endsWith(".m4a")) fs.unlinkSync(path.join(MUSIC_DIR, f)); });
+      return interaction.editReply({
+        embeds: [baseEmbed().setTitle("🗑️ Playlist Dihapus").setDescription(`Berhasil menghapus **${total} lagu** dari playlist.`)]
+      });
     }
 
     const removed = playlist.splice(parseInt(selected), 1)[0];
@@ -271,6 +274,7 @@ client.on(Events.InteractionCreate, async interaction => {
           index = Math.max(index - 2, 0);
         }
         player.stop();
+        setTimeout(playNext, 300);
         break;
 
       case "play_pause":
@@ -281,6 +285,7 @@ client.on(Events.InteractionCreate, async interaction => {
       case "next":
         if (!playlist.length) return;
         player.stop();
+        setTimeout(playNext, 300);
         break;
 
       case "repeat":
@@ -296,124 +301,117 @@ client.on(Events.InteractionCreate, async interaction => {
   if (!interaction.isChatInputCommand()) return;
 
   // Playlist
-  if (interaction.commandName === "playlist") return interaction.reply(buildPlaylistUI());
+  if (interaction.commandName === "playlist") return interaction.reply({ ...buildPlaylistUI(), flags: 64 });
 
   // Play
   if (interaction.commandName === "play") {
-    if (!playlist.length) return interaction.reply("⚠︎ Playlist kosong.");
+    if (!playlist.length) return interaction.reply({ content: "⚠︎ Playlist kosong.", flags: 64 });
     playedSongs.clear();
     index = 0;
+    await interaction.deferReply({ flags: 64 });
     playNext();
-    return interaction.reply("𝄞 Memulai playlist...");
+    return interaction.followUp({ content: "𝄞 Memulai playlist...", flags: 64 });
   }
 
   // Stop
   if (interaction.commandName === "stop") {
     player.stop(true);
-    return interaction.reply("⏹ Musik dihentikan.");
+    return interaction.reply({ content: "⏹ Musik dihentikan.", flags: 64 });
   }
 
   // Skip
   if (interaction.commandName === "skip") {
     player.stop();
-    return interaction.reply("⏭ Lagu dilewati.");
+    setTimeout(playNext, 300);
+    return interaction.reply({ content: "⏭ Lagu dilewati.", flags: 64 });
   }
 
+  // Download
   if (interaction.commandName === "download") {
-  const url = interaction.options.getString("url");
-  const COOKIES_FILE = path.join(__dirname, "cookies.txt");
-  if (!fs.existsSync(COOKIES_FILE)) {
-    return interaction.reply({
-      embeds: [
-        baseEmbed()
-          .setTitle("❌ Cookies Tidak Ditemukan")
-          .setDescription("Silakan letakkan file `cookies.txt` di folder project.")
-      ],
-      ephemeral: true
-    });
+    const url = interaction.options.getString("url");
+    const COOKIES_FILE = path.join(__dirname, "cookies.txt");
+
+    if (!fs.existsSync(COOKIES_FILE)) {
+      return interaction.reply({
+        embeds: [
+          baseEmbed().setTitle("❌ Cookies Tidak Ditemukan").setDescription("Silakan letakkan file `cookies.txt` di folder project.")
+        ],
+        flags: 64
+      });
+    }
+
+    await interaction.deferReply({ ephemeral: false });
+
+const statusMessage = await interaction.followUp({
+  embeds: [baseEmbed().setTitle("📥 Download").setDescription("Sedang memproses, harap tunggu...")],
+  ephemeral: false
+});
+
+    try {
+      const ytDlpPath = path.join(__dirname, "yt-dlp.exe");
+
+      let json = "";
+      await new Promise((resolve, reject) => {
+        const info = spawn(ytDlpPath, [
+          "--dump-json",
+          "--no-playlist",
+          "--cookies", COOKIES_FILE,
+          "--user-agent", "Mozilla/5.0",
+          "--js-runtimes", "node",
+          url
+        ]);
+
+        info.stdout.on("data", d => json += d.toString());
+        info.stderr.on("data", d => console.log(d.toString()));
+
+        info.on("error", reject);
+        info.on("close", code => code === 0 ? resolve() : reject(new Error("Gagal ambil metadata")));
+      });
+
+      let meta = JSON.parse(json);
+      const safeTitle = meta.title.replace(/[\\/:*?"<>|]/g, "");
+
+      await new Promise((resolve, reject) => {
+        const dl = spawn(ytDlpPath, [
+          "-x",
+          "--audio-format", "m4a",
+          "--audio-quality", "0",
+          "--concurrent-fragments", "25",
+          "--buffer-size", "64K",
+          "--no-playlist",
+          "--cookies", COOKIES_FILE,
+          "--user-agent", "Mozilla/5.0",
+          "--js-runtimes", "node",
+          "-o", `${MUSIC_DIR}/${safeTitle}.%(ext)s`,
+          url
+        ]);
+
+        dl.stdout.on("data", d => console.log(d.toString()));
+        dl.stderr.on("data", d => console.log(d.toString()));
+        dl.on("error", reject);
+        dl.on("close", code => code === 0 ? resolve() : reject(new Error("Gagal download")));
+      });
+
+      thumbnailMap[safeTitle] = meta.thumbnail;
+      loadPlaylist();
+
+      await statusMessage.edit({
+  embeds: [
+    baseEmbed()
+      .setTitle("✅ Download Selesai")
+      .setDescription(`🎵 **${meta.title}**`)
+      .setThumbnail(meta.thumbnail)
+  ]
+});
+
+    } catch (err) {
+      console.error(err);
+      await statusMessage.edit({
+        embeds: [baseEmbed().setTitle("❌ Download Gagal").setDescription(err.message)]
+      });
+    }
   }
 
-  // DEFER REPLY
-  await interaction.deferReply({ flags: 64 });
-  await interaction.editReply({
-    embeds: [baseEmbed().setTitle("📥 Download").setDescription("Sedang memproses, harap tunggu...")]
-  });
-
-  try {
-    // Path ke yt-dlp
-    const ytDlpPath = path.join(__dirname, "yt-dlp.exe"); // Windows, sesuaikan di VPS misal "yt-dlp"
-
-    // ================= AMBIL METADATA =================
-    let json = "";
-    await new Promise((resolve, reject) => {
-      const info = spawn(ytDlpPath, [
-        "--dump-json",
-        "--no-playlist",
-        "--cookies", COOKIES_FILE,
-        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        url
-      ]);
-
-      info.stdout.on("data", d => json += d.toString());
-      info.stderr.on("data", d => console.log(d.toString()));
-
-      info.on("error", reject);
-      info.on("close", code => code === 0 ? resolve() : reject(new Error("Gagal ambil metadata")));
-    });
-
-    let meta;
-    try { meta = JSON.parse(json); } 
-    catch { return interaction.editReply("❌ Gagal membaca metadata video."); }
-
-    const safeTitle = meta.title.replace(/[\\/:*?"<>|]/g, "");
-
-    // ================= DOWNLOAD AUDIO =================
-    await new Promise((resolve, reject) => {
-      const dl = spawn(ytDlpPath, [
-        "-x",
-        "--audio-format", "mp3",
-        "--audio-quality", "0",
-        "--concurrent-fragments", "10",
-        "--buffer-size", "16K",
-        "--no-playlist",
-        "--cookies", COOKIES_FILE,
-        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "--sleep-interval", "1-3", // delay antar request untuk menghindari bot detection
-        "-o", `${MUSIC_DIR}/${safeTitle}.%(ext)s`,
-        url
-      ]);
-
-      dl.stdout.on("data", data => console.log(data.toString()));
-      dl.stderr.on("data", data => console.log(data.toString()));
-
-      dl.on("error", reject);
-      dl.on("close", code => code === 0 ? resolve() : reject(new Error("Gagal download")));
-    });
-
-    // ================= SIMPAN THUMBNAIL =================
-    thumbnailMap[safeTitle] = meta.thumbnail;
-    loadPlaylist();
-
-    await interaction.editReply({
-      embeds: [
-        baseEmbed()
-          .setTitle("✅ Download Selesai")
-          .setDescription(`🎵 **${meta.title}**`)
-          .setThumbnail(meta.thumbnail)
-      ]
-    });
-
-  } catch (err) {
-    console.error(err);
-    await interaction.editReply({
-      embeds: [
-        baseEmbed()
-          .setTitle("❌ Download Gagal")
-          .setDescription(err.message)
-      ]
-    });
-  }
-}
 });
 
 // ================= UPDATE NOW PLAYING =================
@@ -421,7 +419,7 @@ async function updateNowPlayingUI() {
   if (!nowPlayingMessage) return;
 
   const currentFile = playlist.length > 0 ? playlist[(index - 1 + playlist.length) % playlist.length] : null;
-  const filename = currentFile ? path.basename(currentFile, ".mp3") : "Tidak ada lagu";
+  const filename = currentFile ? path.basename(currentFile, ".mp3").replace(".m4a", "") : "Tidak ada lagu";
 
   const embed = createNowPlayingEmbed(filename);
   nowPlayingMessage.edit({ embeds: [embed], components: [controlButtons()] }).catch(() => {});
